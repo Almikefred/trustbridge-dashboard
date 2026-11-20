@@ -193,6 +193,15 @@ When operators need to re-index or re-sync Soroban events from a specific ledger
    WHERE "maintainerOrgId" = '<maintainer_org>' AND "eventType" = 'contract';
    ```
 
+## Audit bundle verification (#685)
+
+`GET /api/audit` now includes a deterministic `hash` alongside `entries` and
+`summary`. When archiving an audit bundle for a Wave compliance review, save the
+response as-is and recompute `hashAuditBundle(entries)` before trusting the
+offline copy. Field order, ISO dates, and metadata key sorting are canonicalized;
+entry order is significant. See [AUDIT_BUNDLE_HASHING.md](./AUDIT_BUNDLE_HASHING.md)
+for the full verifier procedure and Node-version stability notes.
+
 ---
 
 ## 6. Dispute Ticket Status Machine & Maintainer ACL
