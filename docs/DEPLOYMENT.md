@@ -53,11 +53,26 @@ DATABASE_URL
 NEXT_PUBLIC_HORIZON_URL=https://horizon.stellar.org
 NEXT_PUBLIC_DEFAULT_ASSET_CODE=USDC
 NEXT_PUBLIC_DEFAULT_ASSET_ISSUER=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+NEXT_PUBLIC_MIN_XLM_BALANCE=1.5
+NEXT_PUBLIC_BASE_RESERVE_XLM=0.5
+SOROBAN_RPC_URL=https://mainnet.sorobanrpc.com
+SOROBAN_NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
+SOROBAN_CONTRACT_ID=
+
 NEXT_PUBLIC_MIN_XLM_BALANCE=1
 METRICS_SCRAPE_TOKEN=<random-32+-byte-secret>
 ```
 
-Deploy once, then update `NEXTAUTH_URL` if using a custom domain.
+`SOROBAN_RPC_URL`, `SOROBAN_NETWORK_PASSPHRASE`, and `SOROBAN_CONTRACT_ID` are
+optional individually, but the network panel warns when the Horizon and Soroban
+URLs classify as two different known networks. The dashboard's network
+configuration is read-only; use the
+[network switching checklist](./ENVIRONMENT.md#network-switching-checklist) and
+rebuild after changing any `NEXT_PUBLIC_*` value.
+
+Deploy once, then update `NEXTAUTH_URL` if using a custom domain. For exact
+user-visible error messages and recovery steps, link
+[Troubleshooting](./TROUBLESHOOTING.md) from your operations runbook.
 
 ---
 
@@ -328,3 +343,250 @@ jobs:
 - [Grafana dashboards & metrics](./grafana/README.md)
 - [Setup guide](./SETUP.md)
 - [Architecture](./ARCHITECTURE.md)
+- [Contributing](./CONTRIBUTING.md)
+
+---
+
+## Background Worker Process
+
+For durable background processing (such as batch rechecks across all contributors,
+single-contributor rechecks, and asynchronous notifications), TrustBridge uses a
+**database-backed queue** (`QueueJob` table in PostgreSQL) so jobs survive
+application restarts and serverless cold-starts.
+
+> [!WARNING]
+> **A separate worker process is mandatory.** Web applications running on serverless
+> platforms like Vercel or Netlify are ephemeral and terminate once an HTTP request
+> ends. If you only deploy the web application without a running worker process,
+> enqueued jobs (e.g., contributor re-checks) will remain in `pending` state and
+> **silently stall**.
+
+### Entrypoint and npm script
+
+- **NPM script:** `npm run worker`
+- **Entrypoint script:** [`scripts/worker.mjs`](../scripts/worker.mjs)
+- **Implementation file:** [`src/lib/queue-worker.ts`](../src/lib/queue-worker.ts)
+
+Under the hood, `scripts/worker.mjs` uses `jiti` to dynamically load `src/lib/queue-worker.ts`,
+registers handlers for `recheck.batch` and `recheck.single`, and calls `runWorker()`.
+The worker runs a continuous poll loop claiming pending jobs from PostgreSQL until
+terminated.
+
+You can also invoke it directly via Node or tsx:
+
+```bash
+node scripts/worker.mjs
+# or
+npx tsx scripts/worker.mjs
+```
+
+---
+
+### Environment variables (shared with web process)
+
+The worker process executes the same backend registration and Horizon verification logic
+as the Next.js server actions and API routes. It must have access to the same environment
+variables as the web process:
+
+| Environment variable | Required / Optional | Purpose in Worker |
+|----------------------|---------------------|-------------------|
+| `DATABASE_URL` | **Required** | PostgreSQL connection string used to poll, claim, and update `QueueJob` rows and update contributor records. |
+| `TOKEN_ENCRYPTION_KEY` | **Required** | 32-byte base64 AES-256 key to decrypt maintainer GitHub access tokens stored in `User.accessToken` for org membership queries. |
+| `GITHUB_MAINTAINER_ORG` | **Required** | Organization slug used to verify maintainer permissions during recheck tasks. |
+| `NEXT_PUBLIC_HORIZON_URL` | **Required** | Stellar Horizon endpoint (e.g. `https://horizon.stellar.org` or `https://horizon-testnet.stellar.org`) to query balances and trustlines. |
+| `NEXT_PUBLIC_DEFAULT_ASSET_CODE` | Optional (default `USDC`) | Asset code to verify contributor trustlines against. |
+| `NEXT_PUBLIC_DEFAULT_ASSET_ISSUER` | Optional | Asset issuer public key for the custom asset trustline check. |
+| `NEXT_PUBLIC_MIN_XLM_BALANCE` | Optional (default `1.5`) | Minimum required spendable XLM balance for readiness status; must match the Action's `min_xlm_reserve`. |
+| `NEXT_PUBLIC_BASE_RESERVE_XLM` | Optional (default `0.5`) | Stellar base reserve used to compute the locked portion of an account balance. |
+| `SOROBAN_RPC_URL` | Optional | RPC URL if Soroban smart contract verification is enabled; keep on the same network as `NEXT_PUBLIC_HORIZON_URL`. |
+| `SOROBAN_NETWORK_PASSPHRASE` | Optional (defaults to testnet) | Passphrase used when signing Soroban transactions; must match `SOROBAN_RPC_URL`. |
+| `SOROBAN_CONTRACT_ID` | Optional | Contract address for Soroban integration, deployed on the same network as `SOROBAN_RPC_URL`. |
+| `SENTRY_DSN` | Optional | Error reporting and sanitized stack traces if Sentry is enabled. |
+
+#### Supplying environment variables
+
+- **Local / VM with dotenv:**
+  ```bash
+  npx dotenv-cli -e .env.production -- npm run worker
+  ```
+- **Shell export:**
+  ```bash
+  export DATABASE_URL="postgresql://..."
+  export TOKEN_ENCRYPTION_KEY="..."
+  export GITHUB_MAINTAINER_ORG="stellar"
+  export NEXT_PUBLIC_HORIZON_URL="https://horizon.stellar.org"
+  npm run worker
+  ```
+
+---
+
+### Starting and supervising the worker
+
+Because the worker must stay alive 24/7, run it under a process manager or container orchestrator with an automatic restart policy.
+
+#### Option A: PM2 (Node Process Manager)
+
+```bash
+# Install PM2 globally
+npm install -g pm2
+
+# Start worker with auto-restart on crash
+pm2 start npm --name "trustbridge-worker" -- run worker
+
+# Configure PM2 to start on system boot
+pm2 startup
+pm2 save
+```
+
+Or using an `ecosystem.config.cjs` file:
+
+```javascript
+module.exports = {
+  apps: [
+    {
+      name: "trustbridge-worker",
+      script: "scripts/worker.mjs",
+      interpreter: "node",
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "512M",
+      env_file: ".env.production",
+    },
+  ],
+};
+```
+
+#### Option B: Systemd Service (Linux VM / EC2)
+
+Create `/etc/systemd/system/trustbridge-worker.service`:
+
+```ini
+[Unit]
+Description=TrustBridge Queue Worker
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=trustbridge
+WorkingDirectory=/var/www/trustbridge-dashboard
+EnvironmentFile=/var/www/trustbridge-dashboard/.env.production
+ExecStart=/usr/bin/npm run worker
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trustbridge-worker
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now trustbridge-worker
+sudo systemctl status trustbridge-worker
+```
+
+#### Option C: Docker & Docker Compose
+
+In a multi-service Docker deployment, add a `worker` service alongside `web` and `postgres`:
+
+```yaml
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["npm", "run", "worker"]
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+```
+
+#### Option D: PaaS (Railway, Fly.io, Render, Heroku)
+
+On PaaS providers, declare a persistent background worker process:
+
+- **Railway / Render:** Create a "Background Worker" service pointing to your repository, set the build command to `npm ci && npm run prisma:generate`, and start command to `npm run worker`.
+- **Fly.io / Procfile:**
+  ```
+  web: npm start
+  worker: npm run worker
+  ```
+
+---
+
+### Restarting the worker
+
+When deploying code changes or updating environment variables:
+
+- **PM2:**
+  ```bash
+  pm2 restart trustbridge-worker
+  ```
+- **Systemd:**
+  ```bash
+  sudo systemctl restart trustbridge-worker
+  ```
+- **Docker Compose:**
+  ```bash
+  docker compose restart worker
+  ```
+
+The worker traps `SIGINT` and `SIGTERM` signals and initiates a graceful shutdown: any in-flight job finishes before the process exits.
+
+---
+
+### Monitoring & health expectations
+
+#### 1. Startup & operational log messages
+
+A healthy worker produces standard log output indicating the poll loop is running:
+
+```
+Starting TrustBridge durable background worker...
+[QueueWorker] Background worker loop started.
+```
+
+When jobs are claimed and processed:
+- Completed jobs: Result details and duration are logged and stored in `QueueJob.result`.
+- Graceful shutdown: `Received SIGTERM. Shutting down worker gracefully...` followed by `[QueueWorker] Background worker loop stopped.`
+
+#### 2. Queue health and backlog inspection
+
+Monitor the PostgreSQL `QueueJob` table directly or through the admin metrics API (`GET /api/metrics`):
+
+| Metric / Indicator | Expected Healthy State | Troubleshooting / Action |
+|--------------------|------------------------|--------------------------|
+| `pendingCount` | `0` (or briefly spikes during batch checks, draining within seconds to minutes) | If `pendingCount` grows continuously or jobs stay `pending` > 1 min, the worker process is down or disconnected. |
+| `processingCount` | `0` when idle, `1`–`2` during active batches | If a job stays `processing` indefinitely after a worker hard-crash, it may require manual reset or cleanup. |
+| `failedCount` | Low or `0` | Inspect `QueueJob.error` column for sanitized error messages (Horizon rate limits, network timeouts, invalid contributor address). |
+| Process restart count | Constant (0 unexpected restarts) | High restart count indicates memory leaks, unhandled fatal exceptions, or bad environment variable configuration. |
+
+#### 3. Database query for quick triage
+
+Run against your production database to check queue status:
+
+```sql
+SELECT status, COUNT(*)
+FROM "QueueJob"
+GROUP BY status;
+```
+
+To inspect recently failed jobs:
+
+```sql
+SELECT id, type, error, "createdAt", "completedAt"
+FROM "QueueJob"
+WHERE status = 'failed'
+ORDER BY "completedAt" DESC
+LIMIT 10;
+```
+
+
