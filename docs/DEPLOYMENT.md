@@ -349,3 +349,402 @@ DATABASE_URL="postgresql://trustbridge:trustbridge-dev-password@localhost:5432/t
 - **Grafana Dashboards & Metrics** — import ready-made dashboards in [docs/grafana/](./grafana/README.md) ([Overview JSON](./grafana/trustbridge-overview.json) / [JSON API JSON](./grafana/trustbridge-json-api.json)) for live payout readiness, outbox backlog, and worker health panels.
 - **Outbox worker** — alert when pending outbox rows exceed your backlog threshold or cursor lag exceeds three poll intervals (see [Failure modes](#failure-modes-when-a-worker-is-missing)).
 - **Cron/export** — alert when no export run completes within 2× the schedule interval, or when the export lock is older than `CRON_EXPORT_LOCK_TTL_MS`.
+- **Prometheus scrape auth** — `/api/metrics/prometheus` requires `METRICS_SCRAPE_TOKEN`; see [Prometheus metrics scrape auth](#prometheus-metrics-scrape-auth).
+- **Horizon rate limits** — batch re-check queries one account per registration; large Waves may need throttling (future enhancement)
+- **Vercel serverless timeout** — default 10s on Hobby; batch re-check may need pagination for 100+ contributors
+- **Database connections** — use connection pooling (Neon pooler, Supabase pooler, or Prisma Accelerate)
+- **Load scenarios** — before opening a Wave or an organic registration spike,
+  run the k6 scenarios in [docs/PERFORMANCE_TESTING.md](./PERFORMANCE_TESTING.md):
+  `npm run test:k6` (`/api/check`), `npm run test:k6:treasury` (payout exports and
+  paginated contributor reads), and `npm run test:k6:registration` (registration
+  spikes plus paginated reads). The last one needs contributor and maintainer
+  session cookies exported in the shell, a non-public Horizon fixture, and a
+  roster outside the freeze window. Never point these scripts at production.
+
+---
+
+## Per-route rate-limit budgets
+
+Each API route enforces an independent per-IP sliding-window budget defined in
+`src/lib/rate-limit.ts` (`ROUTE_BUDGETS`). The budgets reflect each route's
+cost and abuse surface:
+
+| Route | Default budget | Env-var overrides | Rationale |
+|---|---|---|---|
+| `POST /api/register` | **10 req / 60 s** | `REGISTER_RATE_LIMIT_MAX_REQUESTS`, `REGISTER_RATE_LIMIT_WINDOW_MS` | Writes DB + calls Horizon; prevent address-scanning |
+| `GET /api/contributors/export/csv` | **20 req / 60 s** | `EXPORT_RATE_LIMIT_MAX_REQUESTS`, `EXPORT_RATE_LIMIT_WINDOW_MS` | Full-table Postgres read; also subject to API-key 60 req/min |
+| `GET /api/contributors/export/json` | **20 req / 60 s** | (same as CSV) | Same cost profile as CSV export |
+| `GET /api/stats` | **120 req / 60 s** | `STATS_RATE_LIMIT_MAX_REQUESTS`, `STATS_RATE_LIMIT_WINDOW_MS` | Public, aggregate-only; in-process single-flight cache absorbs DB load |
+| `POST /api/check` | **10 req / 60 s** (global default) | `RATE_LIMIT_MAX_REQUESTS`, `RATE_LIMIT_WINDOW_MS` | Horizon call per request |
+
+### Multi-instance caveat
+
+All counters are process-local (`Map` in memory). On a horizontally scaled
+deployment the effective per-IP limit is `maxRequests × N` where N is the
+number of running instances. For cluster-wide enforcement add a Vercel WAF /
+Cloudflare rate-limiting rule or swap to a Redis-backed store such as
+`@upstash/ratelimit`.
+
+### 429 response shape
+
+All rate-limited routes return a consistent body and headers:
+
+```
+HTTP/1.1 429 Too Many Requests
+RateLimit-Limit: <maxRequests>
+RateLimit-Remaining: 0
+RateLimit-Reset: <secondsUntilWindowResets>
+Retry-After: <secondsUntilWindowResets>
+Content-Type: application/json
+
+{ "error": "Too many requests …" }
+```
+
+The `Retry-After` header value is the number of seconds the client should wait
+before retrying. Automated tooling must honour it; ignoring it causes the client
+to remain blocked for the full remaining window.
+
+### Wave operator risk note
+
+Increasing `REGISTER_RATE_LIMIT_MAX_REQUESTS` above 10 during a registration
+sprint can expose the DB and Horizon to amplified load. If you need to raise
+the limit, also raise `HORIZON_BATCH_CONCURRENCY` gradually and monitor
+connection pool saturation (`pendingCount` in `GET /api/metrics`).
+
+---
+
+## Maintenance mode
+
+Use maintenance mode when deploying during a Wave, running a migration, or
+otherwise doing work that must not race with maintainer writes.
+
+### Turning it on / off
+
+Set the **`MAINTENANCE`** environment variable to a truthy value (`1`, `true`,
+`on`, `yes`, `enabled`) and redeploy (or, on Vercel, edit the env var and
+redeploy). Unset it (or set it to `0`) to turn maintenance mode off.
+
+`MAINTENANCE` is intentionally **env-only**. It is the one switch that must keep
+working when the database is down, so it is never gated behind a DB flag — a
+maintainer can always disable it from the platform's env settings. Operators
+running with `FEATURE_FLAGS_DB_ENABLED` additionally have the `maintenance_mode`
+feature flag (`FeatureFlag` row or `FEATURE_FLAG_MAINTENANCE_MODE` env), which
+composes with `MAINTENANCE` (either one being on turns it on).
+
+Optional: **`MAINTENANCE_MESSAGE`** overrides the banner / 503 body text.
+
+### What it does
+
+| Surface | Behaviour while `MAINTENANCE` is on |
+|---|---|
+| Every page | Amber banner at the top (`src/components/MaintenanceBanner.tsx`) |
+| `GET` / `HEAD` on any route | Unchanged — **reads stay up** |
+| `POST` / `PUT` / `PATCH` / `DELETE` under `/api/*` | `503` `{ "error": "maintenance_mode" }` with `Retry-After: 120`, from `src/middleware.ts` |
+| `GET /api/health` | Still `200` — probes and uptime checks are unaffected |
+| `/api/auth/*` | Exempt — sign-in keeps working |
+| `/api/check` | Exempt — a pure Horizon read (POST only to keep the address out of logs); the registration page keeps validating addresses |
+| `/api/webhooks/*` | Exempt — GitHub / trustbridge-action deliveries are **not** dropped; they land and are processed normally |
+
+### Caveats to handle separately
+
+- **Scheduled jobs (cron).** Cron requests are not routed through the Next.js
+  middleware, so `/api/contract-sync`, email nudges, etc. **continue to run**
+  during maintenance. If a deploy needs them paused, disable the cron trigger
+  at the platform (Vercel Cron / GitHub Actions schedule) or set `CRON_SECRET`
+  to a value the scheduler doesn't have for the duration.
+- **Webhook side effects.** Because webhooks are exempt, a delivery received
+  mid-deploy will still write to the database. That is deliberate (retries are
+  finite and data would be lost otherwise) — factor it into migration ordering.
+- **In-flight background queue jobs** already `processing` when the deploy
+  starts are not interrupted; only the *enqueue* endpoints are blocked.
+
+### Validate
+
+```bash
+npm test -- middleware
+```
+
+covers `src/lib/maintenance.ts` and the middleware gate
+(`tests/unit/middleware-maintenance.test.ts`).
+
+---
+
+## CI recommendation
+
+Add GitHub Actions workflow:
+
+```yaml
+# .github/workflows/ci.yml (suggested)
+name: CI
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+        env:
+          DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
+          NEXTAUTH_SECRET: ci-build-secret
+          GITHUB_CLIENT_ID: placeholder
+          GITHUB_CLIENT_SECRET: placeholder
+```
+
+---
+
+## Related docs
+
+- [Grafana dashboards & metrics](./grafana/README.md)
+- [Setup guide](./SETUP.md)
+- [Architecture](./ARCHITECTURE.md)
+- [Contributing](./CONTRIBUTING.md)
+
+---
+
+## Background Worker Process
+
+For durable background processing (such as batch rechecks across all contributors,
+single-contributor rechecks, and asynchronous notifications), TrustBridge uses a
+**database-backed queue** (`QueueJob` table in PostgreSQL) so jobs survive
+application restarts and serverless cold-starts.
+
+> [!WARNING]
+> **A separate worker process is mandatory.** Web applications running on serverless
+> platforms like Vercel or Netlify are ephemeral and terminate once an HTTP request
+> ends. If you only deploy the web application without a running worker process,
+> enqueued jobs (e.g., contributor re-checks) will remain in `pending` state and
+> **silently stall**.
+
+### Entrypoint and npm script
+
+- **NPM script:** `npm run worker`
+- **Entrypoint script:** [`scripts/worker.mjs`](../scripts/worker.mjs)
+- **Implementation file:** [`src/lib/queue-worker.ts`](../src/lib/queue-worker.ts)
+
+Under the hood, `scripts/worker.mjs` uses `jiti` to dynamically load `src/lib/queue-worker.ts`,
+registers handlers for `recheck.batch` and `recheck.single`, and calls `runWorker()`.
+The worker runs a continuous poll loop claiming pending jobs from PostgreSQL until
+terminated.
+
+You can also invoke it directly via Node or tsx:
+
+```bash
+node scripts/worker.mjs
+# or
+npx tsx scripts/worker.mjs
+```
+
+---
+
+### Environment variables (shared with web process)
+
+The worker process executes the same backend registration and Horizon verification logic
+as the Next.js server actions and API routes. It must have access to the same environment
+variables as the web process:
+
+| Environment variable | Required / Optional | Purpose in Worker |
+|----------------------|---------------------|-------------------|
+| `DATABASE_URL` | **Required** | PostgreSQL connection string used to poll, claim, and update `QueueJob` rows and update contributor records. |
+| `TOKEN_ENCRYPTION_KEY` | **Required** | 32-byte base64 AES-256 key to decrypt maintainer GitHub access tokens stored in `User.accessToken` for org membership queries. |
+| `GITHUB_MAINTAINER_ORG` | **Required** | Organization slug used to verify maintainer permissions during recheck tasks. |
+| `NEXT_PUBLIC_HORIZON_URL` | **Required** | Stellar Horizon endpoint (e.g. `https://horizon.stellar.org` or `https://horizon-testnet.stellar.org`) to query balances and trustlines. |
+| `NEXT_PUBLIC_DEFAULT_ASSET_CODE` | Optional (default `USDC`) | Asset code to verify contributor trustlines against. |
+| `NEXT_PUBLIC_DEFAULT_ASSET_ISSUER` | Optional | Asset issuer public key for the custom asset trustline check. |
+| `NEXT_PUBLIC_MIN_XLM_BALANCE` | Optional (default `1.5`) | Minimum required spendable XLM balance for readiness status; must match the Action's `min_xlm_reserve`. |
+| `NEXT_PUBLIC_BASE_RESERVE_XLM` | Optional (default `0.5`) | Stellar base reserve used to compute the locked portion of an account balance. |
+| `SOROBAN_RPC_URL` | Optional | RPC URL if Soroban smart contract verification is enabled; keep on the same network as `NEXT_PUBLIC_HORIZON_URL`. |
+| `SOROBAN_NETWORK_PASSPHRASE` | Optional (defaults to testnet) | Passphrase used when signing Soroban transactions; must match `SOROBAN_RPC_URL`. |
+| `SOROBAN_CONTRACT_ID` | Optional | Contract address for Soroban integration, deployed on the same network as `SOROBAN_RPC_URL`. |
+| `SENTRY_DSN` | Optional | Error reporting and sanitized stack traces if Sentry is enabled. |
+
+#### Supplying environment variables
+
+- **Local / VM with dotenv:**
+  ```bash
+  npx dotenv-cli -e .env.production -- npm run worker
+  ```
+- **Shell export:**
+  ```bash
+  export DATABASE_URL="postgresql://..."
+  export TOKEN_ENCRYPTION_KEY="..."
+  export GITHUB_MAINTAINER_ORG="stellar"
+  export NEXT_PUBLIC_HORIZON_URL="https://horizon.stellar.org"
+  npm run worker
+  ```
+
+---
+
+### Starting and supervising the worker
+
+Because the worker must stay alive 24/7, run it under a process manager or container orchestrator with an automatic restart policy.
+
+#### Option A: PM2 (Node Process Manager)
+
+```bash
+# Install PM2 globally
+npm install -g pm2
+
+# Start worker with auto-restart on crash
+pm2 start npm --name "trustbridge-worker" -- run worker
+
+# Configure PM2 to start on system boot
+pm2 startup
+pm2 save
+```
+
+Or using an `ecosystem.config.cjs` file:
+
+```javascript
+module.exports = {
+  apps: [
+    {
+      name: "trustbridge-worker",
+      script: "scripts/worker.mjs",
+      interpreter: "node",
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "512M",
+      env_file: ".env.production",
+    },
+  ],
+};
+```
+
+#### Option B: Systemd Service (Linux VM / EC2)
+
+Create `/etc/systemd/system/trustbridge-worker.service`:
+
+```ini
+[Unit]
+Description=TrustBridge Queue Worker
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=trustbridge
+WorkingDirectory=/var/www/trustbridge-dashboard
+EnvironmentFile=/var/www/trustbridge-dashboard/.env.production
+ExecStart=/usr/bin/npm run worker
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trustbridge-worker
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now trustbridge-worker
+sudo systemctl status trustbridge-worker
+```
+
+#### Option C: Docker & Docker Compose
+
+In a multi-service Docker deployment, add a `worker` service alongside `web` and `postgres`:
+
+```yaml
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["npm", "run", "worker"]
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+```
+
+#### Option D: PaaS (Railway, Fly.io, Render, Heroku)
+
+On PaaS providers, declare a persistent background worker process:
+
+- **Railway / Render:** Create a "Background Worker" service pointing to your repository, set the build command to `npm ci && npm run prisma:generate`, and start command to `npm run worker`.
+- **Fly.io / Procfile:**
+  ```
+  web: npm start
+  worker: npm run worker
+  ```
+
+---
+
+### Restarting the worker
+
+When deploying code changes or updating environment variables:
+
+- **PM2:**
+  ```bash
+  pm2 restart trustbridge-worker
+  ```
+- **Systemd:**
+  ```bash
+  sudo systemctl restart trustbridge-worker
+  ```
+- **Docker Compose:**
+  ```bash
+  docker compose restart worker
+  ```
+
+The worker traps `SIGINT` and `SIGTERM` signals and initiates a graceful shutdown: any in-flight job finishes before the process exits.
+
+---
+
+### Monitoring & health expectations
+
+#### 1. Startup & operational log messages
+
+A healthy worker produces standard log output indicating the poll loop is running:
+
+```
+Starting TrustBridge durable background worker...
+[QueueWorker] Background worker loop started.
+```
+
+When jobs are claimed and processed:
+- Completed jobs: Result details and duration are logged and stored in `QueueJob.result`.
+- Graceful shutdown: `Received SIGTERM. Shutting down worker gracefully...` followed by `[QueueWorker] Background worker loop stopped.`
+
+#### 2. Queue health and backlog inspection
+
+Monitor the PostgreSQL `QueueJob` table directly or through the admin metrics API (`GET /api/metrics`):
+
+| Metric / Indicator | Expected Healthy State | Troubleshooting / Action |
+|--------------------|------------------------|--------------------------|
+| `pendingCount` | `0` (or briefly spikes during batch checks, draining within seconds to minutes) | If `pendingCount` grows continuously or jobs stay `pending` > 1 min, the worker process is down or disconnected. |
+| `processingCount` | `0` when idle, `1`–`2` during active batches | If a job stays `processing` indefinitely after a worker hard-crash, it may require manual reset or cleanup. |
+| `failedCount` | Low or `0` | Inspect `QueueJob.error` column for sanitized error messages (Horizon rate limits, network timeouts, invalid contributor address). |
+| Process restart count | Constant (0 unexpected restarts) | High restart count indicates memory leaks, unhandled fatal exceptions, or bad environment variable configuration. |
+
+#### 3. Database query for quick triage
+
+Run against your production database to check queue status:
+
+```sql
+SELECT status, COUNT(*)
+FROM "QueueJob"
+GROUP BY status;
+```
+
+To inspect recently failed jobs:
+
+```sql
+SELECT id, type, error, "createdAt", "completedAt"
+FROM "QueueJob"
+WHERE status = 'failed'
+ORDER BY "completedAt" DESC
+LIMIT 10;
+```
+
